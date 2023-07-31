@@ -1,0 +1,6 @@
+checkpoints/
+encoded-ids/
+tokenizer/
+__pycache__/
+
+config.json
