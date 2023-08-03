@@ -76,7 +76,7 @@ def main(args):
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='config.json', help='Location of config file or mount.')
-    parser.add_argument('--first_tokens', type=str, default='Once upon a time', help='String to start with.')
+    parser.add_argument('--first_tokens', type=str, default='then he walked in looking for', help='String to start with.')
     args = parser.parse_args()
     return args
 

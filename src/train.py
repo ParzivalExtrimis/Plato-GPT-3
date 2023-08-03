@@ -139,7 +139,7 @@ def main(args):
     data = torch.tensor(ids, dtype=torch.long)
 
     # Train and test splits
-    n = int(0.9*len(data)) # first 90% will be train, rest val
+    n = int(0.7*len(data)) # first 90% will be train, rest val
     train_data = data[:n]
     val_data = data[n:]
 
@@ -398,13 +398,13 @@ def get_args():
     parser.add_argument('--start_fresh', type=bool, default=False, required=False, help='Flag indicates whether to use checkpoints to load at training.')
     parser.add_argument('--always_override_checkpoint', type=bool, default=False, required=False, help='Flag indicates whether to override checkpoints even when the current loss is higher than overall best at training.')
 
-    parser.add_argument('--batch_size', type=int, default=32, required=False, help='Number of parallel examples to be used per epoch.')
+    parser.add_argument('--batch_size', type=int, default=64, required=False, help='Number of parallel examples to be used per epoch.')
     parser.add_argument('--block_size', type=int, default=512, required=False, help='Context window size of the transformer.')
-    parser.add_argument('--max_epoch', type=int, default=20000, required=False, help='Total number of iterations for training.')
-    parser.add_argument('--eval_interval', type=int, default=1000, required=False, help='Iterations to wait until next loss evaluation.')
-    parser.add_argument('--save_interval', type=int, default=6000, required=False, help='Iterations to wait until next checkpoint save.')
+    parser.add_argument('--max_epoch', type=int, default=1000, required=False, help='Total number of iterations for training.')
+    parser.add_argument('--eval_interval', type=int, default=200, required=False, help='Iterations to wait until next loss evaluation.')
+    parser.add_argument('--save_interval', type=int, default=500, required=False, help='Iterations to wait until next checkpoint save.')
     parser.add_argument('--use-cuda', type=bool, default=True, required=False, help='Flag indicates whether to use CUDA at training.')
-    parser.add_argument('--eval_iters', type=int, default=600, required=False, help='Number of samples to use in-order to smooth out loss over batches.')
+    parser.add_argument('--eval_iters', type=int, default=100, required=False, help='Number of samples to use in-order to smooth out loss over batches.')
     parser.add_argument('--n_embd', type=int, default=768, required=False, help='Size of the embedding dimension.')
     parser.add_argument('--n_head', type=int, default=12, required=False, help='Number of attention heads.')
     parser.add_argument('--n_layer', type=int, default=16, required=False, help='Number of times to loop over tranformer layers.')
@@ -413,13 +413,13 @@ def get_args():
 
     # optimizer args
     parser.add_argument('--use_decay', type=bool, default=True, required=False, help='Flag indicated whether to use learning rate decay ( cosine decay ).')
-    parser.add_argument('--learning_rate', type=float, default=3e-5, required=False, help='The magnitude at which the optimizer step changes the weights.')
-    parser.add_argument('--weight_decay', type=float, default=1e-1, required=False, help='The magnitude at which the optimizer step changes the weights.')
+    parser.add_argument('--learning_rate', type=float, default=2e-6, required=False, help='The magnitude at which the optimizer step changes the weights.')
+    parser.add_argument('--weight_decay', type=float, default=2e-1, required=False, help='The magnitude at which the optimizer step changes the weights.')
     parser.add_argument('--beta1', type=float, default=0.9, required=False, help='Variable controls decay parameters.')
     parser.add_argument('--beta2', type=float, default=0.95, required=False, help='Variable controls decay parameters.')
-    parser.add_argument('--warmup_iters', type=int, default=750, required=False, help='Initial iterations to run linear lr increment upto default lr.')
-    parser.add_argument('--lr_decay_iters', type=int, default=18000, required=False, help='The amount of iterations upto which decay applies. Defaults to min_l after.')
-    parser.add_argument('--min_lr', type=float, default=3e-6, required=False, help='The magnitude at which the optimizer step changes the weights.')
+    parser.add_argument('--warmup_iters', type=int, default=50, required=False, help='Initial iterations to run linear lr increment upto default lr.')
+    parser.add_argument('--lr_decay_iters', type=int, default=950, required=False, help='The amount of iterations upto which decay applies. Defaults to min_l after.')
+    parser.add_argument('--min_lr', type=float, default=5e-7, required=False, help='The magnitude at which the optimizer step changes the weights.')
 
     args = parser.parse_args()
     return args
