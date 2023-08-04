@@ -1,7 +1,6 @@
 import datetime
 import os
 import pytz
-import torch
 import time
 import json
 import math
@@ -9,10 +8,16 @@ import subprocess
 import argparse
 import mlflow
 import mlflow.pytorch
+import torch
+
 from tokenizers import Tokenizer
 from azureml.core import Run
+from typing import List, Tuple
+
 from model.model import GPTLanguageModel, Config
 from utils.web_handler import Web_handler
+from utils.dataloader import BookCorpusDataset
+
 
 def format_time(secs: float) -> str:
     return time.strftime('%H:%M:%S', time.gmtime(secs))
@@ -44,6 +49,8 @@ def main(args):
     start_fresh = args.start_fresh
     always_override_checkpoint = args.always_override_checkpoint
 
+    split_ratio = args.split_ratio
+    dataload_workers = args.dataload_workers
     batch_size = args.batch_size 
     block_size = args.block_size
     max_epoch = args.max_epoch
@@ -72,6 +79,9 @@ def main(args):
 
     w_handle = Web_handler(config_f)
 
+    if dataload_workers < 0:
+        dataload_workers = os.cpu_count()
+
     # to log the dataset being used
     dataset = {
         'name' : dataset_name,
@@ -81,6 +91,8 @@ def main(args):
     params = {
             'start_fresh' : start_fresh,
             'always_override_checkpoint' : always_override_checkpoint,
+            'split_ratio' : split_ratio,
+            'dataload_workers': dataload_workers,
             'batch_size' : batch_size, 
             'block_size' : block_size,
             'max_epcoh' : max_epoch,
@@ -136,39 +148,50 @@ def main(args):
     print('Tokens flattened: ', ids[:25])
     token_count = len(ids)
     print('Total token count: ', token_count)
-    data = torch.tensor(ids, dtype=torch.long)
 
-    # Train and test splits
-    n = int(0.7*len(data)) # first 90% will be train, rest val
-    train_data = data[:n]
-    val_data = data[n:]
+    def get_split(ids: List[int], ratio: int) -> Tuple[List[int], List[int]]:
+        n = int(ratio * len(ids)) # first 90% ( split% ) will be train, rest val
+        train_data = ids[:n]
+        val_data = ids[n:]
+
+        return train_data, val_data
+
+    train_data, val_data = get_split(ids, ratio=split_ratio)
 
     print('sample -- train: ', train_data[:10])
     print('sample -- val:   ', val_data[:10])
 
-    # data loading
-    def get_batch(split):
-        # generate a small batch of data of inputs x and targets y
-        data = train_data if split == 'train' else val_data
-        ix = torch.randint(len(data) - block_size, (batch_size,))
-        x = torch.stack([data[i:i+block_size] for i in ix])
-        y = torch.stack([data[i+1:i+block_size+1] for i in ix])
-        x, y = x.to(device), y.to(device)
-        return x, y
+    train_dataset = BookCorpusDataset(train_data, block_size=10)
+    val_dataset = BookCorpusDataset(val_data, block_size=10)
 
+    train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers = dataload_workers,
+    )
+
+    val_loader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers = dataload_workers,
+    )
+    
+    # with dataloader
     @torch.no_grad()
-    def estimate_loss():
-        out = {}
+    def estimate_loss(split: str):
         model.eval()
-        for split in ['train', 'val']:
-            losses = torch.zeros(eval_iters)
-            for k in range(eval_iters):
-                X, Y = get_batch(split)
-                _, loss = model(X, Y)
-                losses[k] = loss.item()
-            out[split] = losses.mean()
+        loader = train_loader if split == 'train' else val_loader
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X, Y = next(iter(loader))
+            _, loss = model(X.to(device), Y.to(device))
+            losses[k] = loss.item()
+        out = losses.mean()
         model.train()
         return out
+        
     
     # make checkpoints dir for instance; at fresh use for saving checkpoints;
     #                                    at resume use for downloading and loading checkpoints as well as saving
@@ -281,14 +304,13 @@ def main(args):
 
         # every once in a while evaluate the loss on train and val sets
         if epoch % eval_interval == 0:
-            losses = estimate_loss()
-            last_train_loss = losses['train'].item()
-            last_val_loss = losses['val'].item()
+            last_train_loss = estimate_loss('train')
+            last_val_loss = estimate_loss('val')
             if use_mlflow:
-                mlflow.log_metric('Training Loss', losses['train'])
-                mlflow.log_metric('Validation Loss', losses['val'])
+                mlflow.log_metric('Training Loss', last_train_loss)
+                mlflow.log_metric('Validation Loss', last_val_loss)
 
-            print(f"step {epoch}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            print(f"step {epoch}: train loss {last_train_loss:.4f}, val loss {last_val_loss:.4f}")
 
         if epoch % eval_interval*4 == 0 and device=='cuda':
              #track gpu stats
@@ -321,10 +343,10 @@ def main(args):
                 checkpoint = None # free up memory
         
         # sample a batch of data
-        xb, yb = get_batch('train')
+        xb, yb = next(iter(train_loader))
 
         # evaluate the loss
-        _, loss = model(xb, yb)
+        _, loss = model(xb.to(device), yb.to(device))
         optimizer.zero_grad(set_to_none=True)
         #backward pass
         loss.backward()
@@ -336,7 +358,7 @@ def main(args):
             break
 
         # testing only pause, remove at training
-        #break
+        break
 
     end = time.time()
 
@@ -376,8 +398,8 @@ def main(args):
         'params' : params,
         'dataset' : dataset,
         'training_time': elapsed_time,
-        'last_train_loss' : last_train_loss,
-        'last_val_loss' : last_val_loss,
+        'last_train_loss' : last_train_loss.item(),
+        'last_val_loss' : last_val_loss.item(),
         'best_val_loss' : best_val_loss,
     }
         
@@ -395,16 +417,18 @@ def get_args():
     
     parser.add_argument('--config', type=str, default='config.json', help='Location of Config file or mount.')
     parser.add_argument('--dataset_name', type=str, default='bookcorpus', required=False, help='Name of the dataset used to reference Data Asset Store.')
-    parser.add_argument('--start_fresh', type=bool, default=False, required=False, help='Flag indicates whether to use checkpoints to load at training.')
+    parser.add_argument('--start_fresh', type=bool, default=True, required=False, help='Flag indicates whether to use checkpoints to load at training.')
     parser.add_argument('--always_override_checkpoint', type=bool, default=False, required=False, help='Flag indicates whether to override checkpoints even when the current loss is higher than overall best at training.')
 
-    parser.add_argument('--batch_size', type=int, default=64, required=False, help='Number of parallel examples to be used per epoch.')
-    parser.add_argument('--block_size', type=int, default=512, required=False, help='Context window size of the transformer.')
-    parser.add_argument('--max_epoch', type=int, default=1000, required=False, help='Total number of iterations for training.')
-    parser.add_argument('--eval_interval', type=int, default=200, required=False, help='Iterations to wait until next loss evaluation.')
+    parser.add_argument('--split_ratio', type=float, default=0.7, required=False, help='Ratio to split train and val data, in the form (train/val).')
+    parser.add_argument('--dataload_workers', type=int, default=-1, required=False, help='Number of workers to use in parallel dataloading.')
+    parser.add_argument('--batch_size', type=int, default=16, required=False, help='Number of parallel examples to be used per epoch.')
+    parser.add_argument('--block_size', type=int, default=64, required=False, help='Context window size of the transformer.')
+    parser.add_argument('--max_epoch', type=int, default=50, required=False, help='Total number of iterations for training.')
+    parser.add_argument('--eval_interval', type=int, default=10, required=False, help='Iterations to wait until next loss evaluation.')
     parser.add_argument('--save_interval', type=int, default=500, required=False, help='Iterations to wait until next checkpoint save.')
     parser.add_argument('--use-cuda', type=bool, default=True, required=False, help='Flag indicates whether to use CUDA at training.')
-    parser.add_argument('--eval_iters', type=int, default=100, required=False, help='Number of samples to use in-order to smooth out loss over batches.')
+    parser.add_argument('--eval_iters', type=int, default=5, required=False, help='Number of samples to use in-order to smooth out loss over batches.')
     parser.add_argument('--n_embd', type=int, default=768, required=False, help='Size of the embedding dimension.')
     parser.add_argument('--n_head', type=int, default=12, required=False, help='Number of attention heads.')
     parser.add_argument('--n_layer', type=int, default=16, required=False, help='Number of times to loop over tranformer layers.')
@@ -417,8 +441,8 @@ def get_args():
     parser.add_argument('--weight_decay', type=float, default=2e-1, required=False, help='The magnitude at which the optimizer step changes the weights.')
     parser.add_argument('--beta1', type=float, default=0.9, required=False, help='Variable controls decay parameters.')
     parser.add_argument('--beta2', type=float, default=0.95, required=False, help='Variable controls decay parameters.')
-    parser.add_argument('--warmup_iters', type=int, default=50, required=False, help='Initial iterations to run linear lr increment upto default lr.')
-    parser.add_argument('--lr_decay_iters', type=int, default=950, required=False, help='The amount of iterations upto which decay applies. Defaults to min_l after.')
+    parser.add_argument('--warmup_iters', type=int, default=2, required=False, help='Initial iterations to run linear lr increment upto default lr.')
+    parser.add_argument('--lr_decay_iters', type=int, default=48, required=False, help='The amount of iterations upto which decay applies. Defaults to min_l after.')
     parser.add_argument('--min_lr', type=float, default=5e-7, required=False, help='The magnitude at which the optimizer step changes the weights.')
 
     args = parser.parse_args()

@@ -3,4 +3,6 @@ encoded-ids/
 tokenizer/
 __pycache__/
 
+scratchpaper.ipynb
+scratchpaper.py
 config.json
