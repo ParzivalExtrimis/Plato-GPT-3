@@ -4,7 +4,7 @@ from azure.ai.ml.entities import Data
 from azure.ai.ml.constants import AssetTypes
 import azure.ai.ml._artifacts._artifact_utilities as artifact_utils
 import os
-from typing import Union
+from typing import Union, List
 
 class Web_handler:
     def __init__(self, config: str) -> None:

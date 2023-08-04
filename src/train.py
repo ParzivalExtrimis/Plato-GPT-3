@@ -10,6 +10,9 @@ import mlflow
 import mlflow.pytorch
 import torch
 
+from torch.utils.data import DistributedSampler
+from torch.utils.data import DataLoader
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tokenizers import Tokenizer
 from azureml.core import Run
 from typing import List, Tuple
@@ -43,20 +46,31 @@ def main(args):
     epoch = 0
     init_epoch = 0
     output_line_count = 10
-    save_point_datastore_name = 'checkpoint-BPE'
+    save_point_datastore_name = 'checkpoint-BPE-DDP'
+
+    #ddp vars
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    world_rank = int(os.environ.get("RANK", "0"))
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    multinode_available = world_size > 1
+    self_is_main_node = world_rank == 0
+    device = None # uninitialised until DDP init
+
+    #dataloading
+    dataload_workers = args.dataload_workers
+    prefetch_factor = args.prefetch_factor
 
     # hyperparameters
     start_fresh = args.start_fresh
     always_override_checkpoint = args.always_override_checkpoint
 
     split_ratio = args.split_ratio
-    dataload_workers = args.dataload_workers
     batch_size = args.batch_size 
     block_size = args.block_size
     max_epoch = args.max_epoch
     eval_interval = args.eval_interval
     save_interval = args.save_interval
-    device = 'cuda' if torch.cuda.is_available() and args.use_cuda else 'cpu'
     eval_iters = args.eval_iters
     n_embd = args.n_embd
     n_head = args.n_head
@@ -79,6 +93,28 @@ def main(args):
 
     w_handle = Web_handler(config_f)
 
+    ### ddp configs
+
+    # Use CUDA if it is available
+    if torch.cuda.is_available():
+        print(f"Setting up torch.device for CUDA for local gpu:{local_rank}")
+        device = str(torch.device(local_rank))
+    else:
+        print(f"Setting up torch.device for cpu")
+        device = str(torch.device("cpu"))
+
+    if multinode_available:
+        print(
+            f"Running in multinode with backend = 'nccl' local_rank={local_rank} rank={world_rank} size={world_size}"
+        )
+        torch.distributed.init_process_group(
+            "nccl",
+            rank= world_rank,
+            world_size= world_size,
+        )
+    else:
+        print(f"Not running in multinode.")
+
     if dataload_workers < 0:
         dataload_workers = os.cpu_count()
 
@@ -99,7 +135,6 @@ def main(args):
             'eval_interval' : eval_interval,
             'save_interval' : save_interval,
             'learning_rate' : learning_rate,
-            'device' : device,
             'eval_iters' : eval_iters,
             'n_embd' : n_embd,
             'n_head' : n_head,
@@ -114,8 +149,16 @@ def main(args):
             'warmup_iters' : warmup_iters,
             'lr_decay_iters' : lr_decay_iters,
             'min_lr' : min_lr,
+            'world_size' : world_size,
+            'world_rank' : world_rank,
+            'local_world_size' : local_world_size,
+            'local_rank' : local_rank,
+            'multinode_available' : multinode_available,
+            'device' : device,
     }
-    if use_mlflow:
+
+    # only log if running on main node to prevent duplication
+    if use_mlflow and self_is_main_node:
         mlflow.log_params(params)
 
     #ensure download dirs exist
@@ -135,6 +178,7 @@ def main(args):
         name = 'BPE-Tokenizer-BookCorpus',
         save_dir = tokenizer_dir
     )
+    
     #get tokenizer
     tokenizer: Tokenizer = Tokenizer.from_file(os.path.join(tokenizer_dir, 'trained_tokenizer.json'))
 
@@ -164,18 +208,31 @@ def main(args):
     train_dataset = BookCorpusDataset(train_data, block_size=10)
     val_dataset = BookCorpusDataset(val_data, block_size=10)
 
-    train_loader = torch.utils.data.DataLoader(
+    #ddp - sampling training dataset
+    training_dataset_sampler = DistributedSampler(
+            train_dataset, num_replicas=world_size, rank=world_rank
+    )
+    # prefetch
+    optional_data_loading_kwargs = {}
+    if dataload_workers > 0:
+            optional_data_loading_kwargs["prefetch_factor"] = prefetch_factor
+
+    train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
-            shuffle=True,
+            shuffle=False,
             num_workers = dataload_workers,
+            pin_memory=True,
+            sampler = training_dataset_sampler,
+            **optional_data_loading_kwargs,
     )
 
-    val_loader = torch.utils.data.DataLoader(
+    val_loader = DataLoader(
             val_dataset,
             batch_size=batch_size,
-            shuffle=True,
+            shuffle=False,
             num_workers = dataload_workers,
+            pin_memory=True,
     )
     
     # with dataloader
@@ -247,6 +304,9 @@ def main(args):
         best_val_loss = checkpoint['best_val_loss']
         print(f'Resuming model training from checkpoint [saved at: {checkpoint["timestamp"]}]')
 
+    #ddp - wrap model with ddp
+    m = DDP(m)
+
     if not always_override_checkpoint and start_fresh:
         # download saved instances from DataStore
         try:
@@ -288,7 +348,7 @@ def main(args):
     start = time.time()
 
     total_epoch = init_epoch + max_epoch
-    if use_mlflow:
+    if use_mlflow and self_is_main_node:
         mlflow.log_param('total_epoch', total_epoch)
 
     last_train_loss = 1e9
@@ -299,6 +359,10 @@ def main(args):
         curr_time = datetime.datetime.now(pytz.timezone('Asia/Kolkata'))
         
         lr = get_lr(epoch) if use_decay else learning_rate
+
+        if use_mlflow and self_is_main_node:
+            mlflow.log_metric('learning rate', lr)
+
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
@@ -306,32 +370,46 @@ def main(args):
         if epoch % eval_interval == 0:
             last_train_loss = estimate_loss('train')
             last_val_loss = estimate_loss('val')
-            if use_mlflow:
+            if use_mlflow and self_is_main_node:
                 mlflow.log_metric('Training Loss', last_train_loss)
                 mlflow.log_metric('Validation Loss', last_val_loss)
 
-            print(f"step {epoch}: train loss {last_train_loss:.4f}, val loss {last_val_loss:.4f}")
+            print(f"GPU[{local_rank}] - Step {epoch}: Train loss {last_train_loss:.4f}, Val loss {last_val_loss:.4f}")
 
-        if epoch % eval_interval*4 == 0 and device=='cuda':
+        if epoch % (eval_interval*4) == 0 and use_mlflow and device != 'cpu':
              #track gpu stats
             gpu_stats = subprocess.check_output(['nvidia-smi']).decode('utf-8')
-            print(f'GPU Stats: {curr_time}\n {gpu_stats}')
-            if use_mlflow:
-                mlflow.log_text(gpu_stats, os.path.join('gpu_stats', f'{curr_time}.txt'))
+            mlflow.log_text(gpu_stats, os.path.join('gpu_stats', f'GPU-{local_rank}', f'{curr_time}.txt'))
 
-        if epoch % save_interval == 0 and epoch > 0:
+        if epoch % save_interval == 0 and epoch > 0 and self_is_main_node:
             # save checkpoints 
             if last_val_loss < best_val_loss:
                 best_val_loss = last_val_loss # set new record, save state 
+
+                # ddp - check for DDP wrapping
+                if isinstance(m, DDP):
+                    model = m.module.to('cpu')
+                else:
+                    model = m.to('cpu')
+
                 checkpoint = {
                     'model': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'model_args': model_args,
                     'epoch': epoch,
-                    'model_parameters' : model.get_num_params(),
+                    'model_parameters': model.get_num_params(),
                     'best_val_loss': best_val_loss,
                     'timestamp' : curr_time,
                 }
+
+                # mlflow log model
+                if use_mlflow:
+                    mlflow.pytorch.log_model(
+                        model,
+                        artifact_path="saved_model",
+                        registered_model_name=f"{model.get_num_params()/1e6:.2f}M-param-model",  # also register it if name is provided
+                    )
+
                 print(f"saving checkpoint to {os.path.abspath(checkpoints_dir)}")
                 torch.save(checkpoint, os.path.join(checkpoints_dir, 'checkpoint.pt'))
 
@@ -363,51 +441,59 @@ def main(args):
     end = time.time()
 
     #==========================================================================================================
+    if self_is_main_node:
 
-    # ouput logs directory
-    logs_dir = os.path.join('outputs', str(run.display_name))
-    os.makedirs(logs_dir, exist_ok=True)
-    out_text_path = os.path.join(logs_dir, 'out.txt')
+        #ddp - check for DDP wrappings
+        if isinstance(m, DDP):
+            model = m.module
 
-    # generate from the model; and logging
-    context = torch.zeros((1, 1), dtype=torch.long, device=device)
-    print('\n---------------------------------------------\n')
-    for ln in range(output_line_count):
-        print(tokenizer.decode(m.generate(context, max_new_tokens=20)[0].tolist()))
-    print('\n---------------------------------------------\n')
+        # ouput logs directory
+        logs_dir = os.path.join('outputs', str(run.display_name))
+        os.makedirs(logs_dir, exist_ok=True)
+        out_text_path = os.path.join(logs_dir, 'out.txt')
 
-
-    with open(out_text_path, 'w') as out_f:
-        out_f.write(tokenizer.decode(m.generate(context, max_new_tokens=5000)[0].tolist()))
-
-
-    if use_mlflow:
-        mlflow.log_artifact(
-            local_path=out_text_path,
-            artifact_path='generated-text'
-        )
+        # generate from the model; and logging
+        context = torch.zeros((1, 1), dtype=torch.long, device=device)
+        print('\n---------------------------------------------\n')
+        for ln in range(output_line_count):
+            print(tokenizer.decode(model.generate(context, max_new_tokens=20)[0].tolist()))
+        print('\n---------------------------------------------\n')
 
 
-    elapse_interval_sec = end - start
-    elapsed_time = format_time(elapse_interval_sec)
+        with open(out_text_path, 'w') as out_f:
+            out_f.write(tokenizer.decode(model.generate(context, max_new_tokens=5000)[0].tolist()))
 
-    snapshot = {
-        'num_model_params' : m.get_num_params(),
-        'vocab_size' : model_args['vocab_size'],
-        'token_count' : token_count,
-        'params' : params,
-        'dataset' : dataset,
-        'training_time': elapsed_time,
-        'last_train_loss' : last_train_loss.item(),
-        'last_val_loss' : last_val_loss.item(),
-        'best_val_loss' : best_val_loss,
-    }
+
+        if use_mlflow:
+            mlflow.log_artifact(
+                local_path=out_text_path,
+                artifact_path='generated-text'
+            )
+
+
+        elapse_interval_sec = end - start
+        elapsed_time = format_time(elapse_interval_sec)
+
+        snapshot = {
+            'num_model_params' : model.get_num_params(),
+            'vocab_size' : model_args['vocab_size'],
+            'token_count' : token_count,
+            'params' : params,
+            'dataset' : dataset,
+            'training_time': elapsed_time,
+            'last_train_loss' : last_train_loss.item(),
+            'last_val_loss' : last_val_loss.item(),
+            'best_val_loss' : best_val_loss,
+        }
+
         
-    with open(os.path.join(logs_dir,'run_meta.json'), 'w') as fp:
-        json.dump(snapshot, fp, indent=4)
+        with open(os.path.join(logs_dir,'run_meta.json'), 'w') as fp:
+            json.dump(snapshot, fp, indent=4)
 
-    if use_mlflow:
-        mlflow.log_artifact(os.path.join(logs_dir,'run_meta.json'))
+        if use_mlflow:
+            mlflow.log_artifact(os.path.join(logs_dir,'run_meta.json'))
+
+    if use_mlflow:    
         mlflow.end_run()
 
     run.complete()
@@ -422,28 +508,29 @@ def get_args():
 
     parser.add_argument('--split_ratio', type=float, default=0.7, required=False, help='Ratio to split train and val data, in the form (train/val).')
     parser.add_argument('--dataload_workers', type=int, default=-1, required=False, help='Number of workers to use in parallel dataloading.')
-    parser.add_argument('--batch_size', type=int, default=16, required=False, help='Number of parallel examples to be used per epoch.')
-    parser.add_argument('--block_size', type=int, default=64, required=False, help='Context window size of the transformer.')
-    parser.add_argument('--max_epoch', type=int, default=50, required=False, help='Total number of iterations for training.')
-    parser.add_argument('--eval_interval', type=int, default=10, required=False, help='Iterations to wait until next loss evaluation.')
-    parser.add_argument('--save_interval', type=int, default=500, required=False, help='Iterations to wait until next checkpoint save.')
+    parser.add_argument('--prefetch_factor', type=int, default=2, required=False, help='Number of processes to use in-order to prefetch data.')
+    parser.add_argument('--batch_size', type=int, default=32, required=False, help='Number of parallel examples to be used per epoch.')
+    parser.add_argument('--block_size', type=int, default=512, required=False, help='Context window size of the transformer.')
+    parser.add_argument('--max_epoch', type=int, default=50000, required=False, help='Total number of iterations for training.')
+    parser.add_argument('--eval_interval', type=int, default=1000, required=False, help='Iterations to wait until next loss evaluation.')
+    parser.add_argument('--save_interval', type=int, default=5000, required=False, help='Iterations to wait until next checkpoint save.')
     parser.add_argument('--use-cuda', type=bool, default=True, required=False, help='Flag indicates whether to use CUDA at training.')
-    parser.add_argument('--eval_iters', type=int, default=5, required=False, help='Number of samples to use in-order to smooth out loss over batches.')
-    parser.add_argument('--n_embd', type=int, default=768, required=False, help='Size of the embedding dimension.')
-    parser.add_argument('--n_head', type=int, default=12, required=False, help='Number of attention heads.')
+    parser.add_argument('--eval_iters', type=int, default=750, required=False, help='Number of samples to use in-order to smooth out loss over batches.')
+    parser.add_argument('--n_embd', type=int, default=1536, required=False, help='Size of the embedding dimension.')
+    parser.add_argument('--n_head', type=int, default=24, required=False, help='Number of attention heads.')
     parser.add_argument('--n_layer', type=int, default=16, required=False, help='Number of times to loop over tranformer layers.')
-    parser.add_argument('--dropout', type=float, default=0.05, required=False, help='Dropout Ratio')
+    parser.add_argument('--dropout', type=float, default=0.0, required=False, help='Dropout Ratio')
     parser.add_argument('--bias', type=bool, default=True, required=False, help='Flag indicates whether to use biases in Linear and LayerNorm layers.')
 
     # optimizer args
     parser.add_argument('--use_decay', type=bool, default=True, required=False, help='Flag indicated whether to use learning rate decay ( cosine decay ).')
-    parser.add_argument('--learning_rate', type=float, default=2e-6, required=False, help='The magnitude at which the optimizer step changes the weights.')
-    parser.add_argument('--weight_decay', type=float, default=2e-1, required=False, help='The magnitude at which the optimizer step changes the weights.')
+    parser.add_argument('--learning_rate', type=float, default=6e-4, required=False, help='The magnitude at which the optimizer step changes the weights.')
+    parser.add_argument('--weight_decay', type=float, default=1e-1, required=False, help='The magnitude at which the optimizer step changes the weights.')
     parser.add_argument('--beta1', type=float, default=0.9, required=False, help='Variable controls decay parameters.')
     parser.add_argument('--beta2', type=float, default=0.95, required=False, help='Variable controls decay parameters.')
     parser.add_argument('--warmup_iters', type=int, default=2, required=False, help='Initial iterations to run linear lr increment upto default lr.')
-    parser.add_argument('--lr_decay_iters', type=int, default=48, required=False, help='The amount of iterations upto which decay applies. Defaults to min_l after.')
-    parser.add_argument('--min_lr', type=float, default=5e-7, required=False, help='The magnitude at which the optimizer step changes the weights.')
+    parser.add_argument('--lr_decay_iters', type=int, default=45000, required=False, help='The amount of iterations upto which decay applies. Defaults to min_l after.')
+    parser.add_argument('--min_lr', type=float, default=3e-6, required=False, help='The magnitude at which the optimizer step changes the weights.')
 
     args = parser.parse_args()
     return args
